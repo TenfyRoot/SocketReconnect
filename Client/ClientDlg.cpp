@@ -11,40 +11,18 @@
 #define new DEBUG_NEW
 #endif
 
-
-// 用于应用程序“关于”菜单项的 CAboutDlg 对话框
-
-class CAboutDlg : public CDialogEx
-{
-public:
-	CAboutDlg();
-
-// 对话框数据
-	enum { IDD = IDD_ABOUTBOX };
-
-	protected:
-	virtual void DoDataExchange(CDataExchange* pDX);    // DDX/DDV 支持
-
-// 实现
-protected:
-	DECLARE_MESSAGE_MAP()
-};
-
-CAboutDlg::CAboutDlg() : CDialogEx(CAboutDlg::IDD)
-{
-}
-
-void CAboutDlg::DoDataExchange(CDataExchange* pDX)
-{
-	CDialogEx::DoDataExchange(pDX);
-}
-
-BEGIN_MESSAGE_MAP(CAboutDlg, CDialogEx)
-END_MESSAGE_MAP()
-
-
 // CClientDlg 对话框
+UINT WINAPIV ClientRecvThread(LPVOID pParam)
+{
+	CClientDlg * pThis = (CClientDlg *)pParam;
+	return pThis->ClientRecvThreadProc();
+}
 
+UINT WINAPIV ClientConnectThread(LPVOID pParam)
+{
+	CClientDlg * pThis = (CClientDlg *)pParam;
+	return pThis->ClientConnectThreadProc();
+}
 
 
 CClientDlg::CClientDlg(CWnd* pParent /*=NULL*/)
@@ -52,6 +30,22 @@ CClientDlg::CClientDlg(CWnd* pParent /*=NULL*/)
 {
 	m_hIcon = AfxGetApp()->LoadIcon(IDR_MAINFRAME);
 	m_ClientSocket = INVALID_SOCKET;
+	m_bClientConnectThreadWorking = false;
+	m_bClientRecvThreadWorking = false;
+	m_bConnected = false;
+	m_pClientConnectThread = NULL;
+	m_pClientRecvThread = NULL;
+	InitializeCriticalSection(&m_CS_ConnectStatus);
+}
+
+CClientDlg::~CClientDlg()
+{
+	m_bClientConnectThreadWorking = false;
+	WaitForSingleObject(m_pClientConnectThread, 500);
+	m_bClientRecvThreadWorking = false;
+	WaitForSingleObject(m_pClientRecvThread, 500);
+
+	DeleteCriticalSection(&m_CS_ConnectStatus);
 }
 
 void CClientDlg::DoDataExchange(CDataExchange* pDX)
@@ -68,6 +62,7 @@ BEGIN_MESSAGE_MAP(CClientDlg, CDialogEx)
 	ON_BN_CLICKED(IDC_EDIT_SEND, &CClientDlg::OnBnClickedButton2)
 	ON_BN_CLICKED(IDC_BUTTON_CONNECT, &CClientDlg::OnBnClickedButtonConnect)
 	ON_BN_CLICKED(IDC_BUTTON3, &CClientDlg::OnBnClickedButton3)
+	ON_BN_CLICKED(IDC_BUTTON_UNCONNECT, &CClientDlg::OnBnClickedButtonUnconnect)
 END_MESSAGE_MAP()
 
 
@@ -106,7 +101,7 @@ BOOL CClientDlg::OnInitDialog()
 
 	SetDlgItemText(IDC_EDIT_IP, _T("127.0.0.1"));
 	SetDlgItemInt(IDC_EDIT_PORT, 8888);
-	GetDlgItem(IDC_BUTTON3)->EnableWindow(FALSE);
+	SetBtnStatus(0);
 
 	InitSocket();
 	return TRUE;  // 除非将焦点设置到控件，否则返回 TRUE
@@ -114,15 +109,7 @@ BOOL CClientDlg::OnInitDialog()
 
 void CClientDlg::OnSysCommand(UINT nID, LPARAM lParam)
 {
-	if ((nID & 0xFFF0) == IDM_ABOUTBOX)
-	{
-		CAboutDlg dlgAbout;
-		dlgAbout.DoModal();
-	}
-	else
-	{
-		CDialogEx::OnSysCommand(nID, lParam);
-	}
+	CDialogEx::OnSysCommand(nID, lParam);
 }
 
 // 如果向对话框添加最小化按钮，则需要下面的代码
@@ -179,65 +166,114 @@ void CClientDlg::OnBnClickedButton2()
 
 }
 
-UINT __cdecl RecvThreadProc( LPVOID pParam )
-{
-	CClientDlg * pThis = (CClientDlg * ) pParam;
-	while(1)
-	{
-		char szBuf[256] = {0};
-		if(SOCKET_ERROR == recv(pThis->m_ClientSocket,szBuf,250,0))
-		{
-			int nError = WSAGetLastError();
-			CString strError;
-			strError.Format(_T("客户端recv失败:%d"),nError);
-			pThis->m_Sta_Tip.SetWindowText(strError);
-			pThis->GetDlgItem(IDC_BUTTON_CONNECT)->EnableWindow(TRUE);
-			break;
-		}
-		else
-		{
-			pThis->m_ClientRecvListBox.AddString((LPCTSTR)szBuf);
-		}
-	}
-	return 0;
-}
-
 void CClientDlg::OnBnClickedButtonConnect()
 {
-	// TODO: 在此添加控件通知处理程序代码
-	m_Sta_Tip.SetWindowText(_T(""));
-	GetDlgItem(IDC_BUTTON_CONNECT)->EnableWindow(FALSE);
-	m_ClientSocket = socket(AF_INET,
-		SOCK_STREAM,
-		IPPROTO_TCP);
+	SetBtnStatus(1);
+	m_pClientConnectThread = AfxBeginThread(ClientConnectThread, this);
+	m_pClientRecvThread = AfxBeginThread(ClientRecvThread, this);
+	
+}
+
+UINT CClientDlg::ClientConnectThreadProc()
+{
+	if (m_ClientSocket != INVALID_SOCKET)
+		closesocket(m_ClientSocket);
+	m_ClientSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
 	if (m_ClientSocket == INVALID_SOCKET)
 	{
 		m_Sta_Tip.SetWindowText(_T("创建套接字失败"));
-		GetDlgItem(IDC_BUTTON_CONNECT)->EnableWindow(TRUE);
-		return;
+		SetBtnStatus(0);
+		return 0;
 	}
 
 	int nPort = GetDlgItemInt(IDC_EDIT_PORT);
 	CString strIp;
-	GetDlgItemText(IDC_EDIT_IP,strIp);
-
+	GetDlgItemText(IDC_EDIT_IP, strIp);
 	sockaddr_in saServer;
 	saServer.sin_family = AF_INET; //地址家族  
-    saServer.sin_port = htons(nPort); //注意转化为网络节序  
-    saServer.sin_addr.S_un.S_addr = inet_addr(CT2A(strIp));  
-	if(SOCKET_ERROR == connect(m_ClientSocket,(SOCKADDR *)&saServer,sizeof(saServer)))
+	saServer.sin_port = htons(nPort); //注意转化为网络节序  
+	saServer.sin_addr.S_un.S_addr = inet_addr(CT2A(strIp));
+
+	int nLastError = 0;
+
+	m_bClientConnectThreadWorking = true;
+	while (m_bClientConnectThreadWorking)
 	{
-		int nError = WSAGetLastError();
-		CString strError;
-		strError.Format(_T("连接失败:%d"),nError);
-		m_Sta_Tip.SetWindowText(strError);
-		GetDlgItem(IDC_BUTTON_CONNECT)->EnableWindow(TRUE);
-		return ;
+		LockConnectStatus();
+		if (m_bConnected)
+		{
+			UnLockConnectStatus();
+			Sleep(200);
+			continue;
+		}
+		UnLockConnectStatus();
+		
+		if (SOCKET_ERROR == connect(m_ClientSocket, (SOCKADDR *)&saServer, sizeof(saServer)))
+		{
+			int nError = WSAGetLastError();
+			if (nLastError != nError && nError == 10056)//Socket is already connected
+			{
+				closesocket(m_ClientSocket);
+				m_ClientSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+				nLastError = nError;
+			}
+			else if (nLastError != nError && nError == 10061)
+			{
+				m_Sta_Tip.SetWindowText(_T("由于目标计算机积极拒绝，无法连接"));
+				nLastError = nError;
+			}
+			else if (nLastError != nError)
+			{
+				int nError = WSAGetLastError();
+				CString strErrorMsg;
+				strErrorMsg.Format(_T("正在连接[%d]...."), nError);
+				m_Sta_Tip.SetWindowText(strErrorMsg);
+				nLastError = nError;
+			}
+			Sleep(100);
+			continue;
+		}
+		LockConnectStatus(true);
+		m_Sta_Tip.SetWindowText(_T("已连接"));
+		SetBtnStatus(2);
+		nLastError = 0;
 	}
-	GetDlgItem(IDC_BUTTON3)->EnableWindow(TRUE);
-	AfxBeginThread(RecvThreadProc,this);
+	if (m_ClientSocket != INVALID_SOCKET)
+	{
+		closesocket(m_ClientSocket);
+	}
+	m_bConnected = false;
+	return 0;
 }
 
+UINT CClientDlg::ClientRecvThreadProc()
+{
+	m_bClientRecvThreadWorking = true;
+	while (m_bClientRecvThreadWorking)
+	{
+		LockConnectStatus();
+		if (!m_bConnected)
+		{
+			UnLockConnectStatus();
+			Sleep(200);
+			continue;
+		}
+		UnLockConnectStatus();
+
+		char szBuf[256] = { 0 };
+		if (SOCKET_ERROR == recv(m_ClientSocket, szBuf, 250, 0))
+		{
+			int nError = WSAGetLastError();
+			if (nError != 0)
+			{
+				LockConnectStatus(false);
+				continue;
+			}
+		}
+		m_ClientRecvListBox.AddString((LPCTSTR)szBuf);
+	}
+	return 0;
+}
 
 void CClientDlg::OnBnClickedButton3()
 {
@@ -245,7 +281,8 @@ void CClientDlg::OnBnClickedButton3()
 	GetDlgItem(IDC_BUTTON3)->EnableWindow(FALSE);
 	CString strText;
 	GetDlgItemText(IDC_EDIT_SEND,strText);
-	if( SOCKET_ERROR == send(m_ClientSocket,(const char * )strText.GetBuffer(),strText.GetLength() * sizeof(TCHAR),0))
+	CStringA sendText = CT2A(strText);
+	if( SOCKET_ERROR == send(m_ClientSocket, sendText, sendText.GetLength(), 0))
 	{
 		int nError = WSAGetLastError();
 		CString strErrorMsg;
@@ -253,4 +290,38 @@ void CClientDlg::OnBnClickedButton3()
 		m_Sta_Tip.SetWindowText(strErrorMsg);	
 	}
 	GetDlgItem(IDC_BUTTON3)->EnableWindow(TRUE);
+}
+
+
+void CClientDlg::OnBnClickedButtonUnconnect()
+{
+	m_bClientConnectThreadWorking = false;
+	WaitForSingleObject(m_pClientConnectThread, 500);
+	m_bClientRecvThreadWorking = false;
+	WaitForSingleObject(m_pClientRecvThread, 500);
+
+	SetBtnStatus(0);
+}
+
+void CClientDlg::SetBtnStatus(int nFlag)
+{
+	if (nFlag == 0)
+	{
+		GetDlgItem(IDC_BUTTON_CONNECT)->EnableWindow(true);
+		GetDlgItem(IDC_BUTTON_UNCONNECT)->EnableWindow(false);
+		GetDlgItem(IDC_BUTTON3)->EnableWindow(false);
+	}
+	else if (nFlag == 1)
+	{
+		GetDlgItem(IDC_BUTTON_CONNECT)->EnableWindow(false);
+		GetDlgItem(IDC_BUTTON_UNCONNECT)->EnableWindow(false);
+		GetDlgItem(IDC_BUTTON3)->EnableWindow(false);
+	}
+	else
+	{
+		GetDlgItem(IDC_BUTTON_CONNECT)->EnableWindow(false);
+		GetDlgItem(IDC_BUTTON_UNCONNECT)->EnableWindow(true);
+		GetDlgItem(IDC_BUTTON3)->EnableWindow(true);
+	}
+	
 }
